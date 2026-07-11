@@ -15,7 +15,7 @@ from telegram import Bot
 
 load_dotenv()
 
-BOT_VERSION = "2026-07-11-multi-5m-10m-v1"
+BOT_VERSION = "2026-07-11-multi-5m-10m-tv-v2"
 
 
 def env_str(name: str, default: str = "") -> str:
@@ -55,7 +55,7 @@ BASE_FETCH_TIMEFRAME = env_str("BASE_FETCH_TIMEFRAME", "5m").lower()
 CHECK_INTERVAL = env_int("CHECK_INTERVAL", 60)
 CANDLE_LIMIT = env_int("CANDLE_LIMIT", 500)
 
-EXCHANGES = [x.lower() for x in env_list("EXCHANGES", "binance,bybit,okx,bitget,mexc,gateio,kucoin")]
+EXCHANGES = [x.lower() for x in env_list("EXCHANGES", "okx,mexc,gateio,kucoin")]
 QUOTE_ASSETS = [x.upper() for x in env_list("QUOTE_ASSETS", "USDT")]
 EXCLUDE_SYMBOLS = set(
     x.upper()
@@ -153,6 +153,10 @@ REQUIRE_MACD_HISTOGRAM_UP = env_bool("REQUIRE_MACD_HISTOGRAM_UP", True)
 # false = use latest candle, closer to what you see live on TradingView.
 # true = use previous candle, safer because it is closed.
 USE_CLOSED_CANDLE = env_bool("USE_CLOSED_CANDLE", False)
+
+ENABLE_TRADINGVIEW = env_bool("ENABLE_TRADINGVIEW", True)
+TRADINGVIEW_BASE_URL = env_str("TRADINGVIEW_BASE_URL", "https://www.tradingview.com/chart/")
+DISABLE_WEB_PAGE_PREVIEW = env_bool("DISABLE_WEB_PAGE_PREVIEW", True)
 
 STATE_FILE = env_str("STATE_FILE", "data/state.json")
 
@@ -340,6 +344,27 @@ def format_price(value: float) -> str:
     return f"{value:.12g}"
 
 
+TRADINGVIEW_EXCHANGE_CODES = {
+    "okx": "OKX",
+    "mexc": "MEXC",
+    "gateio": "GATEIO",
+    "kucoin": "KUCOIN",
+}
+
+
+def build_tradingview_data(exchange_id: str, symbol: str, timeframe: str) -> Tuple[str, str]:
+    exchange_code = TRADINGVIEW_EXCHANGE_CODES.get(
+        exchange_id.lower().strip(),
+        exchange_id.upper().strip(),
+    )
+    clean_symbol = symbol.split(":")[0].replace("/", "").replace("-", "").upper()
+    tv_code = f"{exchange_code}:{clean_symbol}"
+    interval = str(timeframe_to_minutes(timeframe))
+    separator = "&" if "?" in TRADINGVIEW_BASE_URL else "?"
+    tv_url = f"{TRADINGVIEW_BASE_URL}{separator}symbol={tv_code}&interval={interval}"
+    return tv_code, tv_url
+
+
 def build_targets_block(entry_price: float) -> str:
     if not ENABLE_TARGETS:
         return ""
@@ -391,9 +416,6 @@ def is_tokenized_stock(exchange_id: str, symbol: str, market: Dict[str, Any]) ->
     if any(keyword in market_text for keyword in TOKENIZED_STOCK_KEYWORDS):
         return True
 
-    if exchange_id == "bitget" and base.startswith("R"):
-        if base[1:] in STOCK_TICKERS:
-            return True
 
     if base.endswith("X") and base[:-1] in STOCK_TICKERS:
         return True
@@ -427,7 +449,11 @@ class BotRunner:
         self.state.save()
 
     async def send(self, text: str):
-        await self.telegram.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, disable_web_page_preview=True)
+        await self.telegram.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=text,
+            disable_web_page_preview=DISABLE_WEB_PAGE_PREVIEW,
+        )
 
     def make_exchange(self, exchange_id: str):
         cls = getattr(ccxt, exchange_id)
@@ -543,6 +569,16 @@ class BotRunner:
         r: Dict[str, float],
     ) -> str:
         candle_time = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(r["candle_time"] / 1000))
+        tradingview_block = ""
+        if ENABLE_TRADINGVIEW:
+            tv_code, tv_url = build_tradingview_data(exchange_id, symbol, timeframe)
+            tradingview_block = f"""
+
+📊 TradingView:
+الكود: {tv_code}
+الرابط: {tv_url}
+""".rstrip()
+
         return f"""
 🚀 Buy Signal — {timeframe.upper()}
 
@@ -584,6 +620,7 @@ Prev Hist: {r['prev_hist']:.8f}
 {build_targets_block(r['price'])}
 
 شمعة الإشارة: {candle_time}
+{tradingview_block}
 
 ⚠️ ليست توصية شراء. تحقق من الشارت والسيولة قبل أي قرار.
 """.strip()
@@ -659,7 +696,7 @@ Prev Hist: {r['prev_hist']:.8f}
         await self.send(
             f"✅ Bot started: {BOT_VERSION}\n"
             f"Timeframes: {', '.join(TIMEFRAMES)}\n"
-            "Stoch RSI + MACD + volume increase + stock-token filter"
+            "Stoch RSI + MACD + volume increase + stock-token filter + TradingView"
         )
         while True:
             try:
