@@ -15,7 +15,7 @@ from telegram import Bot
 
 load_dotenv()
 
-BOT_VERSION = "2026-07-11-multi-5m-10m-tv-v2"
+BOT_VERSION = "2026-07-12-multi-5m-10m-4h-confirmation-v3"
 
 
 def env_str(name: str, default: str = "") -> str:
@@ -54,6 +54,14 @@ TIMEFRAMES = [x.lower() for x in env_list("TIMEFRAMES", "5m,10m")]
 BASE_FETCH_TIMEFRAME = env_str("BASE_FETCH_TIMEFRAME", "5m").lower()
 CHECK_INTERVAL = env_int("CHECK_INTERVAL", 60)
 CANDLE_LIMIT = env_int("CANDLE_LIMIT", 500)
+
+ENABLE_4H_CONFIRMATION = env_bool("ENABLE_4H_CONFIRMATION", True)
+CONFIRMATION_TIMEFRAME = env_str("CONFIRMATION_TIMEFRAME", "4h").lower()
+CONFIRMATION_CANDLE_LIMIT = env_int("CONFIRMATION_CANDLE_LIMIT", 300)
+USE_CLOSED_4H_CANDLE = env_bool("USE_CLOSED_4H_CANDLE", True)
+REQUIRE_4H_STOCH_BULLISH = env_bool("REQUIRE_4H_STOCH_BULLISH", True)
+REQUIRE_4H_MACD_BULLISH = env_bool("REQUIRE_4H_MACD_BULLISH", True)
+REQUIRE_4H_MACD_ABOVE_ZERO = env_bool("REQUIRE_4H_MACD_ABOVE_ZERO", True)
 
 EXCHANGES = [x.lower() for x in env_list("EXCHANGES", "okx,mexc,gateio,kucoin")]
 QUOTE_ASSETS = [x.upper() for x in env_list("QUOTE_ASSETS", "USDT")]
@@ -336,6 +344,70 @@ def is_bullish_signal(candles: List[List[float]]) -> Optional[Dict[str, float]]:
     }
 
 
+
+def get_4h_confirmation(candles: List[List[float]]) -> Optional[Dict[str, float]]:
+    """Return bullish 4H confirmation data, or None when the 4H filter fails."""
+    minimum_candles = max(MACD_SLOW + MACD_SIGNAL + 20, 80)
+    if len(candles) < minimum_candles:
+        return None
+
+    df = pd.DataFrame(candles, columns=["time", "open", "high", "low", "close", "volume"])
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+
+    stoch = StochRSIIndicator(
+        close=df["close"],
+        window=STOCH_RSI_PERIOD,
+        smooth1=STOCH_K,
+        smooth2=STOCH_D,
+        fillna=False,
+    )
+    df["stoch_k"] = stoch.stochrsi_k() * 100.0
+    df["stoch_d"] = stoch.stochrsi_d() * 100.0
+
+    macd_ind = MACD(
+        close=df["close"],
+        window_fast=MACD_FAST,
+        window_slow=MACD_SLOW,
+        window_sign=MACD_SIGNAL,
+        fillna=False,
+    )
+    df["macd"] = macd_ind.macd()
+    df["macd_signal"] = macd_ind.macd_signal()
+    df["hist"] = macd_ind.macd_diff()
+
+    idx = len(df) - 2 if USE_CLOSED_4H_CANDLE and len(df) >= 2 else len(df) - 1
+    if idx < 1:
+        return None
+
+    row = df.iloc[idx]
+    needed = [row["stoch_k"], row["stoch_d"], row["macd"], row["macd_signal"], row["hist"]]
+    if any(pd.isna(x) for x in needed):
+        return None
+
+    stoch_bullish = float(row["stoch_k"]) > float(row["stoch_d"])
+    macd_bullish = (
+        float(row["macd"]) > float(row["macd_signal"])
+        and float(row["hist"]) > 0
+    )
+    if REQUIRE_4H_MACD_ABOVE_ZERO:
+        macd_bullish = macd_bullish and float(row["macd"]) > 0
+
+    if REQUIRE_4H_STOCH_BULLISH and not stoch_bullish:
+        return None
+    if REQUIRE_4H_MACD_BULLISH and not macd_bullish:
+        return None
+
+    return {
+        "stoch_k": float(row["stoch_k"]),
+        "stoch_d": float(row["stoch_d"]),
+        "macd": float(row["macd"]),
+        "macd_signal": float(row["macd_signal"]),
+        "hist": float(row["hist"]),
+        "candle_time": float(row["time"]),
+        "candle_mode": "closed" if USE_CLOSED_4H_CANDLE else "live/current",
+    }
+
+
 def format_price(value: float) -> str:
     if value >= 1:
         return f"{value:.6f}"
@@ -543,11 +615,24 @@ class BotRunner:
                 if not base_candles:
                     return results
 
+                confirmation = None
+                if ENABLE_4H_CONFIRMATION:
+                    confirmation_candles = await exchange.fetch_ohlcv(
+                        symbol,
+                        timeframe=CONFIRMATION_TIMEFRAME,
+                        limit=CONFIRMATION_CANDLE_LIMIT,
+                    )
+                    confirmation = get_4h_confirmation(confirmation_candles)
+                    if confirmation is None:
+                        return results
+
                 for timeframe in TIMEFRAMES:
                     try:
                         candles = aggregate_candles(base_candles, timeframe)
                         result = is_bullish_signal(candles)
                         if result:
+                            if confirmation is not None:
+                                result["confirmation"] = confirmation
                             results.append((exchange_id, symbol, timeframe, result))
                     except Exception as e:
                         logger.debug(
@@ -569,6 +654,24 @@ class BotRunner:
         r: Dict[str, float],
     ) -> str:
         candle_time = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(r["candle_time"] / 1000))
+        confirmation_block = ""
+        confirmation = r.get("confirmation")
+        if confirmation:
+            confirmation_time = time.strftime(
+                "%Y-%m-%d %H:%M UTC",
+                time.gmtime(confirmation["candle_time"] / 1000),
+            )
+            confirmation_block = f"""
+
+✅ تأكيد الاتجاه — {CONFIRMATION_TIMEFRAME.upper()}:
+نوع الشمعة: {confirmation['candle_mode']}
+Stoch RSI K/D: {confirmation['stoch_k']:.2f} / {confirmation['stoch_d']:.2f}
+MACD: {confirmation['macd']:.8f}
+Signal: {confirmation['macd_signal']:.8f}
+Histogram: {confirmation['hist']:.8f}
+شمعة التأكيد: {confirmation_time}
+""".rstrip()
+
         tradingview_block = ""
         if ENABLE_TRADINGVIEW:
             tv_code, tv_url = build_tradingview_data(exchange_id, symbol, timeframe)
@@ -618,6 +721,7 @@ Prev Hist: {r['prev_hist']:.8f}
 ✅ MACD إيجابي والهستوجرام يتحسن
 
 {build_targets_block(r['price'])}
+{confirmation_block}
 
 شمعة الإشارة: {candle_time}
 {tradingview_block}
@@ -696,7 +800,7 @@ Prev Hist: {r['prev_hist']:.8f}
         await self.send(
             f"✅ Bot started: {BOT_VERSION}\n"
             f"Timeframes: {', '.join(TIMEFRAMES)}\n"
-            "Stoch RSI + MACD + volume increase + stock-token filter + TradingView"
+            "5m/10m signals + positive 4H MACD/Stoch RSI confirmation + TradingView"
         )
         while True:
             try:
