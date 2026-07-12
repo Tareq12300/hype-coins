@@ -1,5 +1,0 @@
-ccxt
-pandas
-ta
-python-dotenv
-python-telegram-bot
