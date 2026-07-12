@@ -15,7 +15,7 @@ from telegram import Bot
 
 load_dotenv()
 
-BOT_VERSION = "2026-07-12-multi-1m-5m-10m-15m-30m-45m-4h-score-v4"
+BOT_VERSION = "2026-07-12-independent-1h-2h-3h-4h-confirmation-v1"
 
 
 def env_str(name: str, default: str = "") -> str:
@@ -50,33 +50,10 @@ def env_list(name: str, default: str) -> List[str]:
 TELEGRAM_BOT_TOKEN = env_str("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = env_str("TELEGRAM_CHAT_ID")
 
-TIMEFRAMES = [x.lower() for x in env_list("TIMEFRAMES", "1m,5m,10m,15m,30m,45m")]
-# Kept only for backwards compatibility. Each target timeframe now uses the safest source timeframe.
-BASE_FETCH_TIMEFRAME = env_str("BASE_FETCH_TIMEFRAME", "1m").lower()
-CHECK_INTERVAL = env_int("CHECK_INTERVAL", 60)
-CANDLE_LIMIT = env_int("CANDLE_LIMIT", 300)
-MAX_FETCH_CANDLES = env_int("MAX_FETCH_CANDLES", 1000)
-
-ENABLE_TIMEFRAME_SCORE = env_bool("ENABLE_TIMEFRAME_SCORE", True)
-MIN_SIGNAL_SCORE = env_int("MIN_SIGNAL_SCORE", 70)
-FOUR_H_CONFIRMATION_SCORE = env_int("FOUR_H_CONFIRMATION_SCORE", 50)
-
-def parse_timeframe_weights(raw: str) -> Dict[str, int]:
-    weights: Dict[str, int] = {}
-    for item in raw.split(","):
-        item = item.strip()
-        if not item or ":" not in item:
-            continue
-        timeframe, value = item.split(":", 1)
-        try:
-            weights[timeframe.strip().lower()] = int(float(value.strip()))
-        except Exception:
-            continue
-    return weights
-
-TIMEFRAME_WEIGHTS = parse_timeframe_weights(
-    env_str("TIMEFRAME_WEIGHTS", "1m:5,5m:10,10m:15,15m:20,30m:25,45m:30")
-)
+TIMEFRAMES = [x.lower() for x in env_list("TIMEFRAMES", "1h,2h,3h")]
+BASE_FETCH_TIMEFRAME = env_str("BASE_FETCH_TIMEFRAME", "1h").lower()
+CHECK_INTERVAL = env_int("CHECK_INTERVAL", 300)
+CANDLE_LIMIT = env_int("CANDLE_LIMIT", 500)
 
 ENABLE_4H_CONFIRMATION = env_bool("ENABLE_4H_CONFIRMATION", True)
 CONFIRMATION_TIMEFRAME = env_str("CONFIRMATION_TIMEFRAME", "4h").lower()
@@ -195,7 +172,7 @@ logging.basicConfig(
     level=getattr(logging, env_str("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-logger = logging.getLogger("ta-stoch-macd-multi-timeframe-bot")
+logger = logging.getLogger("ta-stoch-macd-5m-10m-bot")
 
 
 class JsonState:
@@ -223,23 +200,23 @@ def timeframe_to_minutes(timeframe: str) -> int:
     timeframe = timeframe.lower().strip()
     if timeframe.endswith("m"):
         return int(timeframe[:-1])
-    raise ValueError(f"Only minute timeframes are supported: {timeframe}")
+    if timeframe.endswith("h"):
+        return int(timeframe[:-1]) * 60
+    if timeframe.endswith("d"):
+        return int(timeframe[:-1]) * 1440
+    raise ValueError(f"Unsupported timeframe: {timeframe}")
 
 
-def aggregate_candles(
-    candles: List[List[float]],
-    source_timeframe: str,
-    target_timeframe: str,
-) -> List[List[float]]:
-    """Build target-minute OHLCV candles from a compatible source timeframe."""
-    base_minutes = timeframe_to_minutes(source_timeframe)
+def aggregate_candles(candles: List[List[float]], target_timeframe: str) -> List[List[float]]:
+    """Build 2H and 3H OHLCV candles from the common 1H source candles."""
+    base_minutes = timeframe_to_minutes(BASE_FETCH_TIMEFRAME)
     target_minutes = timeframe_to_minutes(target_timeframe)
 
     if target_minutes == base_minutes:
         return candles
     if target_minutes < base_minutes or target_minutes % base_minutes != 0:
         raise ValueError(
-            f"{target_timeframe} must be a multiple of {source_timeframe}"
+            f"{target_timeframe} must be a multiple of {BASE_FETCH_TIMEFRAME}"
         )
     if not candles:
         return []
@@ -273,27 +250,6 @@ def aggregate_candles(
 
     flush(bucket_rows, current_bucket)
     return grouped
-
-
-def source_timeframe_for(target_timeframe: str) -> str:
-    """Use direct exchange candles where possible; synthesize 10m and 45m safely."""
-    mapping = {
-        "1m": "1m",
-        "5m": "5m",
-        "10m": "5m",
-        "15m": "15m",
-        "30m": "30m",
-        "45m": "15m",
-    }
-    return mapping.get(target_timeframe.lower(), target_timeframe.lower())
-
-
-def fetch_limit_for(source_timeframe: str, target_timeframe: str) -> int:
-    source_minutes = timeframe_to_minutes(source_timeframe)
-    target_minutes = timeframe_to_minutes(target_timeframe)
-    factor = max(1, target_minutes // source_minutes)
-    requested = CANDLE_LIMIT * factor + factor * 2
-    return min(max(requested, 100), MAX_FETCH_CANDLES)
 
 
 def analysis_index(candles: List[List[float]]) -> int:
@@ -651,10 +607,18 @@ class BotRunner:
         exchange,
         exchange_id: str,
         symbol: str,
-    ) -> List[Tuple[str, str, str, Dict[str, Any]]]:
+    ) -> List[Tuple[str, str, str, Dict[str, float]]]:
         async with self.sem:
-            raw_results: List[Tuple[str, str, str, Dict[str, Any]]] = []
+            results: List[Tuple[str, str, str, Dict[str, float]]] = []
             try:
+                base_candles = await exchange.fetch_ohlcv(
+                    symbol,
+                    timeframe=BASE_FETCH_TIMEFRAME,
+                    limit=CANDLE_LIMIT,
+                )
+                if not base_candles:
+                    return results
+
                 confirmation = None
                 if ENABLE_4H_CONFIRMATION:
                     confirmation_candles = await exchange.fetch_ohlcv(
@@ -664,82 +628,36 @@ class BotRunner:
                     )
                     confirmation = get_4h_confirmation(confirmation_candles)
                     if confirmation is None:
-                        return raw_results
+                        return results
 
-                source_cache: Dict[str, List[List[float]]] = {}
                 for timeframe in TIMEFRAMES:
                     try:
-                        source_tf = source_timeframe_for(timeframe)
-                        if source_tf not in source_cache:
-                            source_cache[source_tf] = await exchange.fetch_ohlcv(
-                                symbol,
-                                timeframe=source_tf,
-                                limit=fetch_limit_for(source_tf, timeframe),
-                            )
-
-                        source_candles = source_cache[source_tf]
-                        candles = aggregate_candles(source_candles, source_tf, timeframe)
-                        if len(candles) > CANDLE_LIMIT:
-                            candles = candles[-CANDLE_LIMIT:]
-
+                        candles = aggregate_candles(base_candles, timeframe)
                         result = is_bullish_signal(candles)
                         if result:
                             if confirmation is not None:
                                 result["confirmation"] = confirmation
-                            raw_results.append((exchange_id, symbol, timeframe, result))
+                            results.append((exchange_id, symbol, timeframe, result))
                     except Exception as e:
                         logger.debug(
                             "%s %s %s analysis failed: %s",
-                            exchange_id, symbol, timeframe, e,
+                            exchange_id,
+                            symbol,
+                            timeframe,
+                            e,
                         )
-
-                matched_timeframes = [item[2] for item in raw_results]
-                timeframe_score = sum(TIMEFRAME_WEIGHTS.get(tf, 0) for tf in matched_timeframes)
-                confirmation_score = (
-                    FOUR_H_CONFIRMATION_SCORE
-                    if ENABLE_4H_CONFIRMATION and confirmation is not None
-                    else 0
-                )
-                total_score = timeframe_score + confirmation_score
-
-                if ENABLE_TIMEFRAME_SCORE and total_score < MIN_SIGNAL_SCORE:
-                    logger.debug(
-                        "%s %s score %d below minimum %d; matches=%s",
-                        exchange_id, symbol, total_score, MIN_SIGNAL_SCORE, matched_timeframes,
-                    )
-                    return []
-
-                for _, _, _, result in raw_results:
-                    result["signal_score"] = total_score
-                    result["timeframe_score"] = timeframe_score
-                    result["confirmation_score"] = confirmation_score
-                    result["matched_timeframes"] = matched_timeframes
-
-                return raw_results
             except Exception as e:
                 logger.debug("%s %s fetch failed: %s", exchange_id, symbol, e)
-                return []
+            return results
 
     def build_message(
         self,
         exchange_id: str,
         symbol: str,
         timeframe: str,
-        r: Dict[str, Any],
+        r: Dict[str, float],
     ) -> str:
         candle_time = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(r["candle_time"] / 1000))
-        score_block = ""
-        if ENABLE_TIMEFRAME_SCORE:
-            matched = ", ".join(r.get("matched_timeframes", [])) or timeframe
-            score_block = f"""
-
-⭐ درجة توافق الفريمات: {int(r.get('signal_score', 0))}
-الحد الأدنى المطلوب: {MIN_SIGNAL_SCORE}
-الفريمات المتوافقة: {matched}
-نقاط الفريمات: {int(r.get('timeframe_score', 0))}
-نقاط تأكيد 4H: {int(r.get('confirmation_score', 0))}
-""".rstrip()
-
         confirmation_block = ""
         confirmation = r.get("confirmation")
         if confirmation:
@@ -805,7 +723,6 @@ Signal: {r['macd_signal']:.8f}
 Histogram: {r['hist']:.8f}
 Prev Hist: {r['prev_hist']:.8f}
 ✅ MACD إيجابي والهستوجرام يتحسن
-{score_block}
 
 {build_targets_block(r['price'])}
 {confirmation_block}
@@ -887,8 +804,7 @@ Prev Hist: {r['prev_hist']:.8f}
         await self.send(
             f"✅ Bot started: {BOT_VERSION}\n"
             f"Timeframes: {', '.join(TIMEFRAMES)}\n"
-            f"Minimum score: {MIN_SIGNAL_SCORE} | 4H score: {FOUR_H_CONFIRMATION_SCORE}\n"
-            "Independent timeframe signals + positive 4H confirmation + TradingView"
+            "Independent 1H/2H/3H signals + positive 4H MACD/Stoch RSI confirmation + TradingView"
         )
         while True:
             try:
