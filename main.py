@@ -16,7 +16,7 @@ from telegram import Bot
 
 load_dotenv()
 
-BOT_VERSION = "2026-07-12-independent-1h-2h-3h-4h-cmc-v2"
+BOT_VERSION = "2026-07-12-independent-1h-2h-3h-4h-cmc-coingecko-v3"
 
 
 def env_str(name: str, default: str = "") -> str:
@@ -181,6 +181,33 @@ CMC_MAX_RANK = env_int("CMC_MAX_RANK", 1000)
 CMC_CACHE_TTL_SECONDS = env_int("CMC_CACHE_TTL_SECONDS", 900)
 CMC_REQUEST_TIMEOUT = env_int("CMC_REQUEST_TIMEOUT", 20)
 CMC_FAIL_OPEN = env_bool("CMC_FAIL_OPEN", False)
+
+# CoinGecko filter and market data
+COINGECKO_API_KEY = env_str("COINGECKO_API_KEY")
+ENABLE_COINGECKO_FILTER = env_bool("ENABLE_COINGECKO_FILTER", True)
+COINGECKO_API_BASE_URL = env_str(
+    "COINGECKO_API_BASE_URL",
+    "https://api.coingecko.com/api/v3",
+)
+COINGECKO_SIMPLE_PRICE_ENDPOINT = env_str(
+    "COINGECKO_SIMPLE_PRICE_ENDPOINT",
+    "/simple/price",
+)
+COINGECKO_API_KEY_HEADER = env_str(
+    "COINGECKO_API_KEY_HEADER",
+    "x-cg-demo-api-key",
+)
+CG_CONVERT = env_str("CG_CONVERT", "USD").lower()
+CG_MIN_MARKET_CAP = env_float("CG_MIN_MARKET_CAP", 1)
+CG_MAX_MARKET_CAP = env_float("CG_MAX_MARKET_CAP", 999999999999)
+CG_MIN_24H_VOLUME = env_float("CG_MIN_24H_VOLUME", 1)
+CG_CACHE_TTL_SECONDS = env_int("CG_CACHE_TTL_SECONDS", 900)
+CG_REQUEST_TIMEOUT = env_int("CG_REQUEST_TIMEOUT", 20)
+CG_FAIL_OPEN = env_bool("CG_FAIL_OPEN", False)
+
+# true = CoinMarketCap and CoinGecko must both pass.
+# false = passing either enabled source is enough.
+REQUIRE_BOTH_SOURCES = env_bool("REQUIRE_BOTH_SOURCES", True)
 
 STATE_FILE = env_str("STATE_FILE", "data/state.json")
 
@@ -564,14 +591,24 @@ class BotRunner:
         self.telegram = Bot(token=TELEGRAM_BOT_TOKEN)
         self.state = JsonState(STATE_FILE)
         self.sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-        self.http = httpx.AsyncClient(
+        self.cmc_http = httpx.AsyncClient(
             timeout=CMC_REQUEST_TIMEOUT,
             headers={
                 "Accept": "application/json",
                 "X-CMC_PRO_API_KEY": CMC_API_KEY,
             },
         )
+
+        cg_headers = {"Accept": "application/json"}
+        if COINGECKO_API_KEY:
+            cg_headers[COINGECKO_API_KEY_HEADER] = COINGECKO_API_KEY
+        self.cg_http = httpx.AsyncClient(
+            timeout=CG_REQUEST_TIMEOUT,
+            headers=cg_headers,
+        )
+
         self.cmc_cache: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
+        self.cg_cache: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
 
     def cooldown_ok(self, key: str) -> bool:
         sent = self.state.data.setdefault("sent", {})
@@ -680,7 +717,7 @@ class BotRunner:
 
         url = f"{CMC_API_BASE_URL.rstrip('/')}/{CMC_QUOTES_ENDPOINT.lstrip('/')}"
         try:
-            response = await self.http.get(
+            response = await self.cmc_http.get(
                 url,
                 params={"symbol": base_symbol, "convert": CMC_CONVERT},
             )
@@ -734,6 +771,110 @@ class BotRunner:
             and CMC_MIN_RANK <= int(rank) <= CMC_MAX_RANK
         )
 
+    async def get_coingecko_data(self, base_symbol: str) -> Optional[Dict[str, Any]]:
+        """Fetch CoinGecko market data using the symbol lookup in /simple/price."""
+        base_symbol = base_symbol.upper().strip()
+        cached = self.cg_cache.get(base_symbol)
+        if cached and time.time() - cached[0] < CG_CACHE_TTL_SECONDS:
+            return cached[1]
+
+        if not ENABLE_COINGECKO_FILTER:
+            return {"filter_enabled": False}
+
+        url = (
+            f"{COINGECKO_API_BASE_URL.rstrip('/')}/"
+            f"{COINGECKO_SIMPLE_PRICE_ENDPOINT.lstrip('/')}"
+        )
+        convert = CG_CONVERT.lower()
+
+        try:
+            response = await self.cg_http.get(
+                url,
+                params={
+                    "symbols": base_symbol.lower(),
+                    "vs_currencies": convert,
+                    "include_tokens": "top",
+                    "include_market_cap": "true",
+                    "include_24hr_vol": "true",
+                    "include_24hr_change": "true",
+                    "include_last_updated_at": "true",
+                    "precision": "full",
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+
+            if not isinstance(payload, dict) or not payload:
+                logger.info("CoinGecko symbol not found: %s", base_symbol)
+                self.cg_cache[base_symbol] = (time.time(), None)
+                return None
+
+            # Symbol queries normally return the top-ranked matching asset.
+            # Response keys can be a symbol or an API coin ID, so use the first object.
+            key, raw = next(iter(payload.items()))
+            if isinstance(raw, list):
+                raw = raw[0] if raw else None
+            if not isinstance(raw, dict):
+                self.cg_cache[base_symbol] = (time.time(), None)
+                return None
+
+            market_cap = raw.get(f"{convert}_market_cap")
+            volume_24h = raw.get(f"{convert}_24h_vol")
+            price = raw.get(convert)
+
+            result = {
+                "id": key,
+                "name": key.replace("-", " ").title(),
+                "symbol": base_symbol,
+                "market_cap": float(market_cap) if market_cap is not None else None,
+                "volume_24h": float(volume_24h) if volume_24h is not None else None,
+                "price": float(price) if price is not None else None,
+                "change_24h": (
+                    float(raw.get(f"{convert}_24h_change"))
+                    if raw.get(f"{convert}_24h_change") is not None
+                    else None
+                ),
+                "last_updated_at": raw.get("last_updated_at"),
+                "filter_enabled": True,
+            }
+            self.cg_cache[base_symbol] = (time.time(), result)
+            return result
+        except Exception as exc:
+            logger.warning("CoinGecko request failed for %s: %s", base_symbol, exc)
+            return None
+
+    def coingecko_filter_passes(self, cg: Optional[Dict[str, Any]]) -> bool:
+        if not ENABLE_COINGECKO_FILTER:
+            return True
+        if cg is None:
+            return CG_FAIL_OPEN
+
+        market_cap = cg.get("market_cap")
+        volume_24h = cg.get("volume_24h")
+        if market_cap is None or volume_24h is None:
+            return CG_FAIL_OPEN
+
+        return (
+            CG_MIN_MARKET_CAP <= float(market_cap) <= CG_MAX_MARKET_CAP
+            and float(volume_24h) >= CG_MIN_24H_VOLUME
+        )
+
+    def market_data_filters_pass(
+        self,
+        cmc: Optional[Dict[str, Any]],
+        cg: Optional[Dict[str, Any]],
+    ) -> bool:
+        checks: List[bool] = []
+
+        if ENABLE_CMC_FILTER:
+            checks.append(self.cmc_filter_passes(cmc))
+        if ENABLE_COINGECKO_FILTER:
+            checks.append(self.coingecko_filter_passes(cg))
+
+        if not checks:
+            return True
+        return all(checks) if REQUIRE_BOTH_SOURCES else any(checks)
+
     async def analyze_symbol(
         self,
         exchange,
@@ -763,9 +904,20 @@ class BotRunner:
                         return results
 
                 base_symbol = symbol.split("/")[0].upper().strip()
-                cmc_data = await self.get_cmc_data(base_symbol)
-                if not self.cmc_filter_passes(cmc_data):
-                    logger.debug("CMC filter rejected %s on %s", symbol, exchange_id)
+                cmc_data, cg_data = await asyncio.gather(
+                    self.get_cmc_data(base_symbol),
+                    self.get_coingecko_data(base_symbol),
+                )
+                if not self.market_data_filters_pass(cmc_data, cg_data):
+                    logger.debug(
+                        "Market-data filters rejected %s on %s | CMC=%s CG=%s",
+                        symbol,
+                        exchange_id,
+                        self.cmc_filter_passes(cmc_data) if ENABLE_CMC_FILTER else "off",
+                        self.coingecko_filter_passes(cg_data)
+                        if ENABLE_COINGECKO_FILTER
+                        else "off",
+                    )
                     return results
 
                 for timeframe in TIMEFRAMES:
@@ -777,6 +929,8 @@ class BotRunner:
                                 result["confirmation"] = confirmation
                             if cmc_data is not None:
                                 result["cmc"] = cmc_data
+                            if cg_data is not None:
+                                result["coingecko"] = cg_data
                             results.append((exchange_id, symbol, timeframe, result))
                     except Exception as e:
                         logger.debug(
@@ -830,6 +984,22 @@ Histogram: {confirmation['hist']:.8f}
 سعر CMC: {format_price(cmc['price']) if cmc.get('price') is not None else 'غير متوفر'}
 """.rstrip()
 
+        coingecko_block = ""
+        cg = r.get("coingecko")
+        if cg and cg.get("filter_enabled", True):
+            change = cg.get("change_24h")
+            change_text = f"{change:+.2f}%" if change is not None else "غير متوفر"
+            coingecko_block = f"""
+
+🦎 CoinGecko:
+الاسم/المعرف: {cg.get('name', symbol.split('/')[0])}
+الرمز: {cg.get('symbol', symbol.split('/')[0])}
+القيمة السوقية: {format_usd(cg.get('market_cap'))}
+حجم تداول 24 ساعة: {format_usd(cg.get('volume_24h'))}
+سعر CoinGecko: {format_price(cg['price']) if cg.get('price') is not None else 'غير متوفر'}
+تغير 24 ساعة: {change_text}
+""".rstrip()
+
         tradingview_block = ""
         if ENABLE_TRADINGVIEW:
             tv_code, tv_url = build_tradingview_data(exchange_id, symbol, timeframe)
@@ -881,6 +1051,7 @@ Prev Hist: {r['prev_hist']:.8f}
 {build_targets_block(r['price'])}
 {confirmation_block}
 {cmc_block}
+{coingecko_block}
 
 شمعة الإشارة: {candle_time}
 {tradingview_block}
@@ -959,7 +1130,7 @@ Prev Hist: {r['prev_hist']:.8f}
         await self.send(
             f"✅ Bot started: {BOT_VERSION}\n"
             f"Timeframes: {', '.join(TIMEFRAMES)}\n"
-            "Independent 1H/2H/3H signals + positive 4H confirmation + CoinMarketCap + TradingView"
+            "Independent 1H/2H/3H signals + positive 4H confirmation + CoinMarketCap + CoinGecko + TradingView"
         )
         try:
             while True:
@@ -969,7 +1140,8 @@ Prev Hist: {r['prev_hist']:.8f}
                     logger.exception("Main scan error: %s", e)
                 await asyncio.sleep(CHECK_INTERVAL)
         finally:
-            await self.http.aclose()
+            await self.cmc_http.aclose()
+            await self.cg_http.aclose()
 
 
 if __name__ == "__main__":
