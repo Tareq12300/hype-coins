@@ -8,6 +8,7 @@ from typing import Dict, List, Tuple, Optional, Any
 
 import ccxt.async_support as ccxt
 import pandas as pd
+import httpx
 from ta.momentum import StochRSIIndicator
 from ta.trend import MACD
 from dotenv import load_dotenv
@@ -15,7 +16,7 @@ from telegram import Bot
 
 load_dotenv()
 
-BOT_VERSION = "2026-07-12-independent-1h-2h-3h-4h-confirmation-v1"
+BOT_VERSION = "2026-07-12-independent-1h-2h-3h-4h-cmc-v2"
 
 
 def env_str(name: str, default: str = "") -> str:
@@ -165,6 +166,21 @@ USE_CLOSED_CANDLE = env_bool("USE_CLOSED_CANDLE", False)
 ENABLE_TRADINGVIEW = env_bool("ENABLE_TRADINGVIEW", True)
 TRADINGVIEW_BASE_URL = env_str("TRADINGVIEW_BASE_URL", "https://www.tradingview.com/chart/")
 DISABLE_WEB_PAGE_PREVIEW = env_bool("DISABLE_WEB_PAGE_PREVIEW", True)
+
+# CoinMarketCap filter and market data
+CMC_API_KEY = env_str("CMC_API_KEY")
+ENABLE_CMC_FILTER = env_bool("ENABLE_CMC_FILTER", True)
+CMC_API_BASE_URL = env_str("CMC_API_BASE_URL", "https://pro-api.coinmarketcap.com")
+CMC_QUOTES_ENDPOINT = env_str("CMC_QUOTES_ENDPOINT", "/v3/cryptocurrency/quotes/latest")
+CMC_CONVERT = env_str("CMC_CONVERT", "USD").upper()
+CMC_MIN_MARKET_CAP = env_float("CMC_MIN_MARKET_CAP", 1)
+CMC_MAX_MARKET_CAP = env_float("CMC_MAX_MARKET_CAP", 1000000000)
+CMC_MIN_24H_VOLUME = env_float("CMC_MIN_24H_VOLUME", 1)
+CMC_MIN_RANK = env_int("CMC_MIN_RANK", 1)
+CMC_MAX_RANK = env_int("CMC_MAX_RANK", 1000)
+CMC_CACHE_TTL_SECONDS = env_int("CMC_CACHE_TTL_SECONDS", 900)
+CMC_REQUEST_TIMEOUT = env_int("CMC_REQUEST_TIMEOUT", 20)
+CMC_FAIL_OPEN = env_bool("CMC_FAIL_OPEN", False)
 
 STATE_FILE = env_str("STATE_FILE", "data/state.json")
 
@@ -503,11 +519,59 @@ def is_tokenized_stock(exchange_id: str, symbol: str, market: Dict[str, Any]) ->
     return False
 
 
+
+
+def format_usd(value: Optional[float]) -> str:
+    if value is None:
+        return "غير متوفر"
+    return f"${value:,.0f}"
+
+
+def normalize_cmc_candidates(payload: Dict[str, Any], symbol: str) -> List[Dict[str, Any]]:
+    """Support both list and dict response shapes from CoinMarketCap quotes endpoints."""
+    data = payload.get("data", {}) if isinstance(payload, dict) else {}
+    raw = data.get(symbol.upper()) if isinstance(data, dict) else None
+    if raw is None and isinstance(data, dict):
+        raw = data.get(symbol.lower())
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [x for x in raw if isinstance(x, dict)]
+    if isinstance(raw, dict):
+        return [raw]
+    return []
+
+
+def choose_cmc_candidate(candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Choose the most likely asset when a ticker maps to multiple CMC assets."""
+    if not candidates:
+        return None
+
+    def sort_key(item: Dict[str, Any]):
+        rank = item.get("cmc_rank")
+        try:
+            rank_value = int(rank)
+        except Exception:
+            rank_value = 10**9
+        active = 0 if int(item.get("is_active", 1) or 0) == 1 else 1
+        return active, rank_value
+
+    return sorted(candidates, key=sort_key)[0]
+
+
 class BotRunner:
     def __init__(self):
         self.telegram = Bot(token=TELEGRAM_BOT_TOKEN)
         self.state = JsonState(STATE_FILE)
         self.sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+        self.http = httpx.AsyncClient(
+            timeout=CMC_REQUEST_TIMEOUT,
+            headers={
+                "Accept": "application/json",
+                "X-CMC_PRO_API_KEY": CMC_API_KEY,
+            },
+        )
+        self.cmc_cache: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
 
     def cooldown_ok(self, key: str) -> bool:
         sent = self.state.data.setdefault("sent", {})
@@ -602,6 +666,74 @@ class BotRunner:
         )
         return symbols
 
+    async def get_cmc_data(self, base_symbol: str) -> Optional[Dict[str, Any]]:
+        base_symbol = base_symbol.upper().strip()
+        cached = self.cmc_cache.get(base_symbol)
+        if cached and time.time() - cached[0] < CMC_CACHE_TTL_SECONDS:
+            return cached[1]
+
+        if not ENABLE_CMC_FILTER:
+            return {"filter_enabled": False}
+        if not CMC_API_KEY:
+            logger.error("ENABLE_CMC_FILTER=true but CMC_API_KEY is missing")
+            return None
+
+        url = f"{CMC_API_BASE_URL.rstrip('/')}/{CMC_QUOTES_ENDPOINT.lstrip('/')}"
+        try:
+            response = await self.http.get(
+                url,
+                params={"symbol": base_symbol, "convert": CMC_CONVERT},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            candidate = choose_cmc_candidate(normalize_cmc_candidates(payload, base_symbol))
+            if not candidate:
+                logger.info("CMC symbol not found: %s", base_symbol)
+                self.cmc_cache[base_symbol] = (time.time(), None)
+                return None
+
+            quote = candidate.get("quote", {}).get(CMC_CONVERT, {})
+            market_cap = quote.get("market_cap")
+            volume_24h = quote.get("volume_24h")
+            price = quote.get("price")
+            rank = candidate.get("cmc_rank")
+
+            result = {
+                "id": candidate.get("id"),
+                "name": candidate.get("name") or base_symbol,
+                "symbol": candidate.get("symbol") or base_symbol,
+                "slug": candidate.get("slug"),
+                "rank": int(rank) if rank is not None else None,
+                "market_cap": float(market_cap) if market_cap is not None else None,
+                "volume_24h": float(volume_24h) if volume_24h is not None else None,
+                "price": float(price) if price is not None else None,
+                "last_updated": quote.get("last_updated") or candidate.get("last_updated"),
+                "filter_enabled": True,
+            }
+            self.cmc_cache[base_symbol] = (time.time(), result)
+            return result
+        except Exception as exc:
+            logger.warning("CMC request failed for %s: %s", base_symbol, exc)
+            return None
+
+    def cmc_filter_passes(self, cmc: Optional[Dict[str, Any]]) -> bool:
+        if not ENABLE_CMC_FILTER:
+            return True
+        if cmc is None:
+            return CMC_FAIL_OPEN
+
+        market_cap = cmc.get("market_cap")
+        volume_24h = cmc.get("volume_24h")
+        rank = cmc.get("rank")
+        if market_cap is None or volume_24h is None or rank is None:
+            return CMC_FAIL_OPEN
+
+        return (
+            CMC_MIN_MARKET_CAP <= float(market_cap) <= CMC_MAX_MARKET_CAP
+            and float(volume_24h) >= CMC_MIN_24H_VOLUME
+            and CMC_MIN_RANK <= int(rank) <= CMC_MAX_RANK
+        )
+
     async def analyze_symbol(
         self,
         exchange,
@@ -630,6 +762,12 @@ class BotRunner:
                     if confirmation is None:
                         return results
 
+                base_symbol = symbol.split("/")[0].upper().strip()
+                cmc_data = await self.get_cmc_data(base_symbol)
+                if not self.cmc_filter_passes(cmc_data):
+                    logger.debug("CMC filter rejected %s on %s", symbol, exchange_id)
+                    return results
+
                 for timeframe in TIMEFRAMES:
                     try:
                         candles = aggregate_candles(base_candles, timeframe)
@@ -637,6 +775,8 @@ class BotRunner:
                         if result:
                             if confirmation is not None:
                                 result["confirmation"] = confirmation
+                            if cmc_data is not None:
+                                result["cmc"] = cmc_data
                             results.append((exchange_id, symbol, timeframe, result))
                     except Exception as e:
                         logger.debug(
@@ -674,6 +814,20 @@ MACD: {confirmation['macd']:.8f}
 Signal: {confirmation['macd_signal']:.8f}
 Histogram: {confirmation['hist']:.8f}
 شمعة التأكيد: {confirmation_time}
+""".rstrip()
+
+        cmc_block = ""
+        cmc = r.get("cmc")
+        if cmc and cmc.get("filter_enabled", True):
+            rank_text = f"#{cmc['rank']}" if cmc.get("rank") is not None else "غير متوفر"
+            cmc_block = f"""
+
+📊 CoinMarketCap:
+الاسم: {cmc.get('name', symbol.split('/')[0])} ({cmc.get('symbol', symbol.split('/')[0])})
+الترتيب: {rank_text}
+القيمة السوقية: {format_usd(cmc.get('market_cap'))}
+حجم تداول 24 ساعة: {format_usd(cmc.get('volume_24h'))}
+سعر CMC: {format_price(cmc['price']) if cmc.get('price') is not None else 'غير متوفر'}
 """.rstrip()
 
         tradingview_block = ""
@@ -726,6 +880,7 @@ Prev Hist: {r['prev_hist']:.8f}
 
 {build_targets_block(r['price'])}
 {confirmation_block}
+{cmc_block}
 
 شمعة الإشارة: {candle_time}
 {tradingview_block}
@@ -804,14 +959,17 @@ Prev Hist: {r['prev_hist']:.8f}
         await self.send(
             f"✅ Bot started: {BOT_VERSION}\n"
             f"Timeframes: {', '.join(TIMEFRAMES)}\n"
-            "Independent 1H/2H/3H signals + positive 4H MACD/Stoch RSI confirmation + TradingView"
+            "Independent 1H/2H/3H signals + positive 4H confirmation + CoinMarketCap + TradingView"
         )
-        while True:
-            try:
-                await self.scan_once()
-            except Exception as e:
-                logger.exception("Main scan error: %s", e)
-            await asyncio.sleep(CHECK_INTERVAL)
+        try:
+            while True:
+                try:
+                    await self.scan_once()
+                except Exception as e:
+                    logger.exception("Main scan error: %s", e)
+                await asyncio.sleep(CHECK_INTERVAL)
+        finally:
+            await self.http.aclose()
 
 
 if __name__ == "__main__":
